@@ -1,16 +1,22 @@
-from app.core.database import Base, engine
+from datetime import datetime
 
-# 必须导入所有模型，确保 metadata 能识别到表
-from app.models.file_record import FileRecord  # noqa: F401
-from app.models.project_info import ProjectInfo  # noqa: F401
-from app.models.contract_info import ContractInfo  # noqa: F401
-from app.models.billing_record import BillingRecord  # noqa: F401
+from sqlalchemy import Column, DateTime, Integer, String, Text
+
+from app.core.database import Base
 
 
-def init_db() -> None:
-    Base.metadata.create_all(bind=engine)
+class FileRecord(Base):
+    __tablename__ = "file_record"
 
-
-if __name__ == "__main__":
-    init_db()
-    print("Database initialized successfully.")
+    id = Column(Integer, primary_key=True, index=True)
+    file_uuid = Column(String(64), unique=True, nullable=False, index=True)
+    file_name = Column(String(255), nullable=False)
+    file_type = Column(String(50), nullable=False, index=True)
+    storage_path = Column(String(500), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    file_hash = Column(String(128), nullable=False, index=True)
+    mime_type = Column(String(100), nullable=True)
+    upload_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    uploader = Column(String(100), nullable=True)
+    parse_status = Column(String(50), nullable=False, default="PENDING")
+    ext_json = Column(Text, nullable=True)
