@@ -1,0 +1,34 @@
+# ========== 本地实验 ==========
+experiment/
+
+# ========== Python ==========
+__pycache__/
+*.pyc
+*.pyo
+
+# ========== 虚拟环境 ==========
+venv/
+.env
+.env.*
+
+# ========== 编辑器 ==========
+.vscode/
+.idea/
+
+# 忽略虚拟环境文件夹（必须）
+envs/
+py310/
+
+# 忽略 Python 自动生成的缓存
+__pycache__/
+*.pyc
+
+# 忽略经分系统的本地数据库文件（防止泄露业务数据）
+agents/business_analysis_system/data/sqlite/*.db
+
+# 忽略上传的临时合同/计收单文件
+agents/business_analysis_system/data/uploads/
+agents/business_analysis_system/data/temp/
+
+# 忽略敏感配置
+.env
