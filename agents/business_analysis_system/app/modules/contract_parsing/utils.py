@@ -58,36 +58,37 @@ def validate_file_path(file_path: str) -> Path:
     return path
 
 
-def extract_text_from_pdf(file_path: str, max_pages: Optional[int] = None) -> Tuple[str, int, List[str]]:
-    """
-    Return:
-    - extracted_text
-    - processed_page_count
-    - warnings
-    """
-    from pypdf import PdfReader  # lazy import
+def extract_text_from_pdf(file_path: str, max_pages=None):
 
-    path = validate_file_path(file_path)
-    reader = PdfReader(str(path))
+    from pypdf import PdfReader
+    reader = PdfReader(file_path)
 
-    warnings: List[str] = []
-    texts: List[str] = []
+    text_all = []
+    warnings = []
 
-    total_pages = len(reader.pages)
-    pages_to_process = total_pages if max_pages is None else min(total_pages, max_pages)
+    for i, page in enumerate(reader.pages):
 
-    for idx in range(pages_to_process):
-        try:
-            page = reader.pages[idx]
-            text = page.extract_text() or ""
+        if max_pages and i >= max_pages:
+            break
 
-            if not text.strip():
-                warnings.append(f"page {idx + 1} extracted empty text")
+        text = page.extract_text()
 
-            texts.append(text)
-        except Exception as exc:
-            warnings.append(f"page {idx + 1} extract failed: {str(exc)}")
-            texts.append("")
+        if text and text.strip():
+            text_all.append(text)
+            continue
 
-    extracted_text = "\n".join(texts).strip()
-    return extracted_text, pages_to_process, warnings
+        warnings.append(f"page {i+1} extracted empty text, fallback OCR")
+
+        # OCR fallback
+        from pdf2image import convert_from_path
+        import pytesseract
+
+        images = convert_from_path(file_path, first_page=i+1, last_page=i+1)
+
+        ocr_text = pytesseract.image_to_string(images[0], lang="chi_sim")
+
+        text_all.append(ocr_text)
+
+    extracted_text = "\n".join(text_all)
+
+    return extracted_text, len(text_all), warnings
