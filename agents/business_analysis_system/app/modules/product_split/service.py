@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -40,8 +40,10 @@ class ProductSplitService:
         if request.contract_id is not None:
             self._validate_contract_exists(request.contract_id)
 
+        self._validate_split_detail_items(request.details)
+
         suggestion_code = self._generate_code("SUG")
-        category_split_json = self._dump_json(self._normalize_category_split_json(request.category_split_json))
+        category_split_json = self._normalize_category_split_json(request.category_split_json)
         reference_case_ids = self._dump_json(request.reference_case_ids or [])
 
         with self._get_conn() as conn:
@@ -67,7 +69,7 @@ class ProductSplitService:
                     request.source_type,
                     request.source_model,
                     request.llm_enabled_flag,
-                    category_split_json,
+                    self._dump_json(category_split_json),
                     request.evidence_summary,
                     reference_case_ids,
                     request.matrix_applied_flag,
@@ -90,7 +92,7 @@ class ProductSplitService:
                         product_info["product_code"],
                         product_info["product_name"],
                         product_info["category_code"],
-                        str(item.split_ratio),
+                        str(self._to_decimal_required(item.split_ratio)),
                         None,
                         request.source_type,
                         None,
@@ -181,8 +183,10 @@ class ProductSplitService:
         if request.from_suggestion_id is not None:
             self._validate_suggestion_exists(request.from_suggestion_id)
 
+        self._validate_split_detail_items(request.details)
+
         draft_code = self._generate_code("DRF")
-        category_split_json = self._dump_json(self._normalize_category_split_json(request.category_split_json))
+        category_split_json = self._normalize_category_split_json(request.category_split_json)
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -207,7 +211,7 @@ class ProductSplitService:
                     request.draft_source_type,
                     request.llm_enabled_flag,
                     request.from_suggestion_id,
-                    category_split_json,
+                    self._dump_json(category_split_json),
                     "DRAFT",
                     "DRAFT",
                     "ENABLED",
@@ -228,7 +232,7 @@ class ProductSplitService:
                         product_info["product_code"],
                         product_info["product_name"],
                         product_info["category_code"],
-                        str(item.split_ratio),
+                        str(self._to_decimal_required(item.split_ratio)),
                         "MANUAL" if request.from_suggestion_id is None else "FROM_SUGGESTION",
                         None,
                         item.adjust_reason,
@@ -305,16 +309,19 @@ class ProductSplitService:
     def update_draft(self, draft_id: int, request: ProductSplitDraftUpdateRequest) -> Dict[str, Any]:
         current = self.get_draft(draft_id)
 
+        if request.details is not None:
+            self._validate_split_detail_items(request.details)
+
+        new_draft_name = request.draft_name if request.draft_name is not None else current["draft_name"]
+        new_category_split_json = (
+            self._normalize_category_split_json(request.category_split_json)
+            if request.category_split_json is not None
+            else current["category_split_json"]
+        )
+        new_remarks = request.remarks if request.remarks is not None else current["remarks"]
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
-
-            new_draft_name = request.draft_name if request.draft_name is not None else current["draft_name"]
-            new_category_split_json = (
-                self._dump_json(self._normalize_category_split_json(request.category_split_json))
-                if request.category_split_json is not None
-                else self._dump_json(current["category_split_json"])
-            )
-            new_remarks = request.remarks if request.remarks is not None else current["remarks"]
 
             cursor.execute(
                 """
@@ -324,7 +331,7 @@ class ProductSplitService:
                 """,
                 (
                     new_draft_name,
-                    new_category_split_json,
+                    self._dump_json(new_category_split_json),
                     "EDITING",
                     request.updated_by,
                     new_remarks,
@@ -347,7 +354,7 @@ class ProductSplitService:
                             product_info["product_code"],
                             product_info["product_name"],
                             product_info["category_code"],
-                            str(item.split_ratio),
+                            str(self._to_decimal_required(item.split_ratio)),
                             "MANUAL",
                             None,
                             item.adjust_reason,
@@ -378,6 +385,12 @@ class ProductSplitService:
         if not draft["details"]:
             raise HTTPException(status_code=400, detail="draft details cannot be empty")
 
+        # 1. 对 draft 明细做最终校验
+        self._validate_existing_draft_details(draft["details"])
+
+        # 2. 自动汇总六大类比例
+        category_split_json = self._build_category_split_json(draft["details"])
+
         rule_code = self._generate_code("RUL")
 
         with self._get_conn() as conn:
@@ -399,7 +412,7 @@ class ProductSplitService:
                     request.rule_type,
                     request.project_type_tag,
                     request.applicable_scope,
-                    self._dump_json(draft["category_split_json"]),
+                    self._dump_json(category_split_json),
                     draft_id,
                     "APPROVED",
                     request.reviewer,
@@ -455,13 +468,15 @@ class ProductSplitService:
                 rule_detail_rows,
             )
 
+            # 3. 回写 draft 的 category_split_json 和状态
             cursor.execute(
                 """
                 UPDATE product_split_rule_draft
-                SET edit_status = ?, review_status = ?, reviewer = ?, reviewed_at = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+                SET category_split_json = ?, edit_status = ?, review_status = ?, reviewer = ?, reviewed_at = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
+                    self._dump_json(category_split_json),
                     "SUBMITTED",
                     "APPROVED",
                     request.reviewer,
@@ -812,6 +827,70 @@ class ProductSplitService:
             "category_code": row["category_code"],
         }
 
+    def _validate_split_detail_items(self, detail_items: List[Any]) -> None:
+        if not detail_items:
+            raise HTTPException(status_code=400, detail="details cannot be empty")
+
+        seen_product_codes = set()
+        total_ratio = Decimal("0")
+
+        for item in detail_items:
+            product_code = item.product_code
+            split_ratio = self._to_decimal_required(item.split_ratio)
+
+            if product_code in seen_product_codes:
+                raise HTTPException(status_code=400, detail=f"duplicate product_code found: {product_code}")
+            seen_product_codes.add(product_code)
+
+            if split_ratio < Decimal("0") or split_ratio > Decimal("1"):
+                raise HTTPException(status_code=400, detail=f"split_ratio out of range for product_code: {product_code}")
+
+            total_ratio += split_ratio
+
+        if abs(total_ratio - Decimal("1")) > Decimal("0.0001"):
+            raise HTTPException(status_code=400, detail="sum of details.split_ratio must be 1")
+
+    def _validate_existing_draft_details(self, detail_rows: List[Dict[str, Any]]) -> None:
+        if not detail_rows:
+            raise HTTPException(status_code=400, detail="draft details cannot be empty")
+
+        seen_product_codes = set()
+        total_ratio = Decimal("0")
+
+        for item in detail_rows:
+            product_code = item["product_code"]
+            split_ratio = self._to_decimal_required(item["split_ratio"])
+
+            if product_code in seen_product_codes:
+                raise HTTPException(status_code=400, detail=f"duplicate product_code found in draft: {product_code}")
+            seen_product_codes.add(product_code)
+
+            if split_ratio < Decimal("0") or split_ratio > Decimal("1"):
+                raise HTTPException(status_code=400, detail=f"split_ratio out of range in draft for product_code: {product_code}")
+
+            total_ratio += split_ratio
+
+        if abs(total_ratio - Decimal("1")) > Decimal("0.0001"):
+            raise HTTPException(status_code=400, detail="sum of draft detail split_ratio must be 1")
+
+    def _build_category_split_json(self, detail_rows: List[Dict[str, Any]]) -> Dict[str, str]:
+        category_map: Dict[str, Decimal] = {}
+
+        for item in detail_rows:
+            category_code = item["category_code"]
+            split_ratio = self._to_decimal_required(item["split_ratio"])
+
+            if category_code not in category_map:
+                category_map[category_code] = Decimal("0")
+
+            category_map[category_code] += split_ratio
+
+        total_ratio = sum(category_map.values(), Decimal("0"))
+        if abs(total_ratio - Decimal("1")) > Decimal("0.0001"):
+            raise HTTPException(status_code=400, detail="sum of category split ratio must be 1")
+
+        return {key: str(value) for key, value in category_map.items()}
+
     # ============================================================
     # Basic Helpers
     # ============================================================
@@ -855,6 +934,12 @@ class ProductSplitService:
         except Exception:
             return None
 
+    def _to_decimal_required(self, value: Any) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"invalid decimal value: {value}")
+
     def _normalize_category_split_json(
         self,
         category_split_json: Optional[Dict[str, Decimal]],
@@ -864,10 +949,12 @@ class ProductSplitService:
 
         normalized: Dict[str, str] = {}
         total = Decimal("0")
+
         for key, value in category_split_json.items():
-            decimal_value = Decimal(str(value))
+            decimal_value = self._to_decimal_required(value)
             if decimal_value < Decimal("0") or decimal_value > Decimal("1"):
                 raise HTTPException(status_code=400, detail=f"category split ratio out of range: {key}")
+
             normalized[key] = str(decimal_value)
             total += decimal_value
 
