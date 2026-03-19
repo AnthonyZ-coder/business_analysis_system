@@ -4,6 +4,7 @@ from app.core.config import APP_DESCRIPTION, APP_NAME, APP_VERSION
 from app.core.init_db import init_db
 from app.modules.data_input.routes import router as data_input_router
 from app.modules.contract_parsing.routes import router as contract_parsing_router
+from app.modules.product_split.routes import router as product_split_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -26,6 +27,7 @@ def create_app() -> FastAPI:
 
     app.include_router(data_input_router)
     app.include_router(contract_parsing_router) 
+    app.include_router(product_split_router)
     return app
 
 
