@@ -1,14 +1,19 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.common.enums import NextStep, ParseStatus
 from app.models.billing_record import BillingRecord
 from app.models.contract_info import ContractInfo
 from app.models.file_record import FileRecord
-from app.modules.contract_parsing.schemas import ParseRequest
+from app.modules.contract_parsing.schemas import (
+    ContractParseAdjustRequest,
+    ParseRequest,
+)
 from app.modules.contract_parsing.utils import (
     dump_json_text,
     extract_text_from_pdf,
@@ -16,6 +21,26 @@ from app.modules.contract_parsing.utils import (
     merge_dict,
     safe_text_preview,
 )
+
+
+ALLOWED_ADJUST_FIELDS = [
+    "contract_code",
+    "contract_name",
+    "project_code",
+    "customer_name",
+    "contract_amount",
+    "sign_date",
+]
+
+
+def _normalize_adjust_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
 
 class ContractParsingService:
@@ -28,6 +53,8 @@ class ContractParsingService:
     - persist parsing result into ext_json
     - update parse statuses
     - provide downstream module payloads
+    - allow manual adjustment for parsed contract fields
+    - record adjustment logs
     """
 
     def __init__(self, db: Session):
@@ -87,7 +114,7 @@ class ContractParsingService:
                         "contract_name": contract.contract_name,
                         "project_code": contract.project_code,
                         "customer_name": contract.customer_name,
-                        "contract_amount": str(contract.contract_amount),
+                        "contract_amount": str(contract.contract_amount) if contract.contract_amount is not None else None,
                         "sign_date": str(contract.sign_date) if contract.sign_date else None,
                     },
                 }
@@ -148,6 +175,21 @@ class ContractParsingService:
             except Exception:
                 parsed_at_value = None
 
+        ext_fields = parsing_result.get("reserved_extracted_fields", {})
+        if not isinstance(ext_fields, dict):
+            ext_fields = {}
+
+        # 当前生效值以 contract_info 为准，保证人工修正后列表页和详情页一致
+        ext_fields = {
+            **ext_fields,
+            "contract_code": contract.contract_code,
+            "contract_name": contract.contract_name,
+            "project_code": contract.project_code,
+            "customer_name": contract.customer_name,
+            "contract_amount": str(contract.contract_amount) if contract.contract_amount is not None else None,
+            "sign_date": str(contract.sign_date) if contract.sign_date else None,
+        }
+
         return {
             "record_type": "contract",
             "record_id": contract.id,
@@ -161,7 +203,7 @@ class ContractParsingService:
             "text_preview": parsing_result.get("text_preview", ""),
             "warnings": validation_warnings if isinstance(validation_warnings, list) else [],
             "parsed_at": parsed_at_value,
-            "ext": parsing_result.get("reserved_extracted_fields", {}),
+            "ext": ext_fields,
         }
 
     def build_contract_internal_payload(self, contract_id: int) -> Dict[str, Any]:
@@ -179,7 +221,7 @@ class ContractParsingService:
                 "contract_name": contract.contract_name,
                 "project_code": contract.project_code,
                 "customer_name": contract.customer_name,
-                "contract_amount": str(contract.contract_amount),
+                "contract_amount": str(contract.contract_amount) if contract.contract_amount is not None else None,
                 "tax_included": contract.tax_included,
                 "sign_date": str(contract.sign_date) if contract.sign_date else None,
                 "file_record_id": contract.file_record_id,
@@ -195,6 +237,218 @@ class ContractParsingService:
                 "reserved_for": ["product_split"],
             },
         }
+
+    def adjust_contract_parse_result(
+        self,
+        contract_id: int,
+        request: ContractParseAdjustRequest,
+    ) -> Dict[str, Any]:
+        """
+        人工修正合同解析结果：
+        1. 更新 contract_info 当前生效字段
+        2. 写入 contract_parse_adjust_log 留痕
+        3. 更新 ext_json 中 parsing_result.reserved_extracted_fields
+        4. 标记 manual_adjusted_flag / last_adjusted_at
+        """
+        contract = self.get_contract(contract_id)
+
+        current_data = {
+            "contract_code": contract.contract_code,
+            "contract_name": contract.contract_name,
+            "project_code": contract.project_code,
+            "customer_name": contract.customer_name,
+            "contract_amount": contract.contract_amount,
+            "sign_date": contract.sign_date,
+        }
+
+        request_data = request.model_dump(exclude_unset=True)
+
+        adjust_reason = request_data.pop("adjust_reason", None)
+        adjusted_by = request_data.pop("adjusted_by", None)
+        remarks = request_data.pop("remarks", None)
+
+        changed_fields: List[Dict[str, Any]] = []
+
+        for field_name in ALLOWED_ADJUST_FIELDS:
+            if field_name not in request_data:
+                continue
+
+            old_value = current_data.get(field_name)
+            new_value = request_data.get(field_name)
+
+            old_norm = _normalize_adjust_value(old_value)
+            new_norm = _normalize_adjust_value(new_value)
+
+            if old_norm == new_norm:
+                continue
+
+            changed_fields.append(
+                {
+                    "field_name": field_name,
+                    "old_value": old_norm,
+                    "new_value": new_norm,
+                    "raw_new_value": new_value,
+                }
+            )
+
+        if not changed_fields:
+            return {
+                "contract_id": contract_id,
+                "message": "no fields changed",
+                "changed_fields": [],
+            }
+
+        now = datetime.utcnow()
+        now_str = now.isoformat()
+
+        # 1. 更新 ORM 对象中的标准字段
+        for item in changed_fields:
+            setattr(contract, item["field_name"], item["raw_new_value"])
+
+        # 2. 更新 ext_json 中的 reserved_extracted_fields，保证查询结果同步
+        contract_ext = load_json_text(contract.ext_json)
+        parsing_result = contract_ext.get("parsing_result", {})
+        reserved_fields = parsing_result.get("reserved_extracted_fields", {})
+        if not isinstance(reserved_fields, dict):
+            reserved_fields = {}
+
+        for item in changed_fields:
+            reserved_fields[item["field_name"]] = item["new_value"]
+
+        parsing_result["reserved_extracted_fields"] = reserved_fields
+        contract_ext["parsing_result"] = parsing_result
+        contract.ext_json = dump_json_text(contract_ext)
+
+        # 3. 使用 SQL 直接更新扩展字段，避免 ORM Model 未定义这些列时启动失败
+        self.db.execute(
+            text(
+                """
+                UPDATE contract_info
+                SET manual_adjusted_flag = :manual_adjusted_flag,
+                    last_adjusted_at = :last_adjusted_at
+                WHERE id = :contract_id
+                """
+            ),
+            {
+                "manual_adjusted_flag": 1,
+                "last_adjusted_at": now_str,
+                "contract_id": contract_id,
+            },
+        )
+
+        # 4. 记录每个字段的调整日志
+        for item in changed_fields:
+            self.db.execute(
+                text(
+                    """
+                    INSERT INTO contract_parse_adjust_log
+                    (
+                        contract_id,
+                        field_name,
+                        old_value,
+                        new_value,
+                        adjust_reason,
+                        source_type,
+                        adjusted_by,
+                        adjusted_at,
+                        remarks
+                    )
+                    VALUES
+                    (
+                        :contract_id,
+                        :field_name,
+                        :old_value,
+                        :new_value,
+                        :adjust_reason,
+                        :source_type,
+                        :adjusted_by,
+                        :adjusted_at,
+                        :remarks
+                    )
+                    """
+                ),
+                {
+                    "contract_id": contract_id,
+                    "field_name": item["field_name"],
+                    "old_value": item["old_value"],
+                    "new_value": item["new_value"],
+                    "adjust_reason": adjust_reason,
+                    "source_type": "MANUAL",
+                    "adjusted_by": adjusted_by,
+                    "adjusted_at": now_str,
+                    "remarks": remarks,
+                },
+            )
+
+        self.db.commit()
+        self.db.refresh(contract)
+
+        return {
+            "contract_id": contract_id,
+            "message": "contract parse result adjusted successfully",
+            "changed_fields": [
+                {
+                    "field_name": item["field_name"],
+                    "old_value": item["old_value"],
+                    "new_value": item["new_value"],
+                }
+                for item in changed_fields
+            ],
+            "manual_adjusted_flag": 1,
+            "last_adjusted_at": now_str,
+        }
+
+    def list_contract_adjust_logs(self, contract_id: int) -> List[Dict[str, Any]]:
+        contract = self.get_contract(contract_id)
+
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    contract_id,
+                    field_name,
+                    old_value,
+                    new_value,
+                    adjust_reason,
+                    source_type,
+                    adjusted_by,
+                    adjusted_at,
+                    remarks
+                FROM contract_parse_adjust_log
+                WHERE contract_id = :contract_id
+                ORDER BY adjusted_at DESC, id DESC
+                """
+            ),
+            {"contract_id": contract.id},
+        ).mappings().all()
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            adjusted_at = row["adjusted_at"]
+            adjusted_at_value = None
+            if adjusted_at:
+                try:
+                    adjusted_at_value = datetime.fromisoformat(str(adjusted_at))
+                except Exception:
+                    adjusted_at_value = None
+
+            results.append(
+                {
+                    "id": row["id"],
+                    "contract_id": row["contract_id"],
+                    "field_name": row["field_name"],
+                    "old_value": row["old_value"],
+                    "new_value": row["new_value"],
+                    "adjust_reason": row["adjust_reason"],
+                    "source_type": row["source_type"],
+                    "adjusted_by": row["adjusted_by"],
+                    "adjusted_at": adjusted_at_value,
+                    "remarks": row["remarks"],
+                }
+            )
+
+        return results
 
     # ============================================================
     # Billing Record
@@ -254,10 +508,10 @@ class ContractParsingService:
                         "billing_code": billing_record.billing_code,
                         "project_code": billing_record.project_code,
                         "contract_code": billing_record.contract_code,
-                        "billing_amount": str(billing_record.billing_amount),
+                        "billing_amount": str(billing_record.billing_amount) if billing_record.billing_amount is not None else None,
                         "billing_ratio": str(billing_record.billing_ratio) if billing_record.billing_ratio is not None else None,
                         "phase_name": billing_record.phase_name,
-                        "billing_date": str(billing_record.billing_date),
+                        "billing_date": str(billing_record.billing_date) if billing_record.billing_date else None,
                     },
                 }
             },
@@ -346,8 +600,8 @@ class ContractParsingService:
                 "billing_code": billing_record.billing_code,
                 "project_code": billing_record.project_code,
                 "contract_code": billing_record.contract_code,
-                "billing_date": str(billing_record.billing_date),
-                "billing_amount": str(billing_record.billing_amount),
+                "billing_date": str(billing_record.billing_date) if billing_record.billing_date else None,
+                "billing_amount": str(billing_record.billing_amount) if billing_record.billing_amount is not None else None,
                 "billing_ratio": str(billing_record.billing_ratio) if billing_record.billing_ratio is not None else None,
                 "phase_name": billing_record.phase_name,
                 "tax_included": billing_record.tax_included,

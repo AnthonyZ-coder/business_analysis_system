@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -24,6 +25,32 @@ class ParseResultResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     parsed_at: Optional[datetime] = None
     ext: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ContractParseAdjustRequest(BaseModel):
+    contract_code: Optional[str] = Field(default=None, max_length=64)
+    contract_name: Optional[str] = Field(default=None, max_length=255)
+    project_code: Optional[str] = Field(default=None, max_length=64)
+    customer_name: Optional[str] = Field(default=None, max_length=255)
+    contract_amount: Optional[Decimal] = Field(default=None, ge=0)
+    sign_date: Optional[date] = None
+
+    adjust_reason: Optional[str] = None
+    adjusted_by: Optional[str] = Field(default=None, max_length=64)
+    remarks: Optional[str] = None
+
+
+class ContractParseAdjustLogResponse(BaseModel):
+    id: int
+    contract_id: int
+    field_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    adjust_reason: Optional[str] = None
+    source_type: str
+    adjusted_by: Optional[str] = None
+    adjusted_at: datetime
+    remarks: Optional[str] = None
 
 
 class InternalPayloadResponse(BaseModel):
