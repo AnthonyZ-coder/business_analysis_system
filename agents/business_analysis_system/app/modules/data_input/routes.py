@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.modules.data_input.schemas import (
     BillingRecordCreateRequest,
     ContractCreateRequest,
+    ContractUpdateRequest,
     ProjectCreateRequest,
 )
 from app.modules.data_input.service import DataInputService
@@ -226,6 +227,35 @@ def get_contract(
         }
     )
 
+@router.put("/contracts/{contract_id}", response_model=APIResponse)
+def update_contract(
+    contract_id: int,
+    request: ContractUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    service = DataInputService(db)
+    record = service.update_contract(contract_id, request)
+    return APIResponse(
+        data={
+            "id": record.id,
+            "contract_code": record.contract_code,
+            "contract_name": record.contract_name,
+            "project_code": record.project_code,
+            "customer_name": record.customer_name,
+            "contract_amount": str(record.contract_amount),
+            "tax_included": record.tax_included,
+            "sign_date": record.sign_date,
+            "file_record_id": record.file_record_id,
+            "parse_status": record.parse_status,
+            "status": record.status,
+            "rule_status": record.rule_status,
+            "rule_template_code": record.rule_template_code,
+            "next_step": record.next_step,
+            "remarks": record.remarks,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+        }
+    )
 
 @router.get("/contracts", response_model=APIResponse)
 def list_contracts(

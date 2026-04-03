@@ -1,4 +1,6 @@
 import json
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from app.models.project_info import ProjectInfo
 from app.modules.data_input.schemas import (
     BillingRecordCreateRequest,
     ContractCreateRequest,
+    ContractUpdateRequest,
     ProjectCreateRequest,
 )
 from app.modules.data_input.utils import (
@@ -219,6 +222,91 @@ class DataInputService:
         if not record:
             raise HTTPException(status_code=404, detail="contract not found")
         return record
+    
+    def update_contract(self, contract_id: int, request: ContractUpdateRequest) -> ContractInfo:
+        record = self.db.query(ContractInfo).filter(ContractInfo.id == contract_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="contract not found")
+
+        if request.contract_code and request.contract_code != record.contract_code:
+            exists = (
+                self.db.query(ContractInfo)
+                .filter(
+                    ContractInfo.contract_code == request.contract_code,
+                    ContractInfo.id != contract_id,
+                )
+                .first()
+            )
+            if exists:
+                raise HTTPException(status_code=409, detail="contract_code already exists")
+
+        linked_file = None
+        if request.file_record_id is not None:
+            linked_file = (
+                self.db.query(FileRecord)
+                .filter(FileRecord.id == request.file_record_id)
+                .first()
+            )
+            if not linked_file:
+                raise HTTPException(status_code=400, detail="file_record_id does not exist")
+
+        before_data = {
+            "contract_code": record.contract_code,
+            "contract_name": record.contract_name,
+            "project_code": record.project_code,
+            "customer_name": record.customer_name,
+            "contract_amount": str(record.contract_amount),
+            "tax_included": record.tax_included,
+            "sign_date": str(record.sign_date) if record.sign_date else None,
+            "file_record_id": record.file_record_id,
+            "remarks": record.remarks,
+        }
+
+        if request.contract_code is not None:
+            record.contract_code = request.contract_code
+        if request.contract_name is not None:
+            record.contract_name = request.contract_name
+        if request.customer_name is not None:
+            record.customer_name = request.customer_name
+        if request.contract_amount is not None:
+            record.contract_amount = request.contract_amount
+        if request.tax_included is not None:
+            record.tax_included = request.tax_included
+        if request.sign_date is not None:
+            record.sign_date = request.sign_date
+        if request.file_record_id is not None:
+            record.file_record_id = request.file_record_id
+        if request.remarks is not None:
+            record.remarks = request.remarks
+
+        try:
+            ext_data = json.loads(record.ext_json) if record.ext_json else {}
+        except Exception:
+            ext_data = {}
+
+        ext_data["manual_adjustment"] = {
+            "adjusted": True,
+            "adjusted_by": request.operator,
+            "adjusted_at": datetime.utcnow().isoformat(),
+            "before": before_data,
+            "after": {
+                "contract_code": record.contract_code,
+                "contract_name": record.contract_name,
+                "project_code": record.project_code,
+                "customer_name": record.customer_name,
+                "contract_amount": str(record.contract_amount),
+                "tax_included": record.tax_included,
+                "sign_date": str(record.sign_date) if record.sign_date else None,
+                "file_record_id": record.file_record_id,
+                "remarks": record.remarks,
+            },
+        }
+
+        record.ext_json = json.dumps(ext_data, ensure_ascii=False)
+
+        self.db.commit()
+        self.db.refresh(record)
+        return record        
 
     def list_contracts(self) -> List[ContractInfo]:
         return self.db.query(ContractInfo).order_by(ContractInfo.id.desc()).all()

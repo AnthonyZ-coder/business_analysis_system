@@ -126,3 +126,12 @@ class InternalPayloadResponse(BaseModel):
     payload: Dict[str, Any]
     warnings: List[str] = Field(default_factory=list)
     trace: Dict[str, Any] = Field(default_factory=dict)
+
+class ContractUpdateRequest(BaseCreateRequest):
+    contract_code: Optional[str] = Field(default=None, min_length=2, max_length=64)
+    contract_name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    customer_name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    contract_amount: Optional[Decimal] = Field(default=None, gt=0)
+    tax_included: Optional[bool] = None
+    sign_date: Optional[date] = None
+    file_record_id: Optional[int] = None    
